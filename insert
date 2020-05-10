@@ -1,0 +1,282 @@
+#!/usr/bin/env python3.8
+from functools import partial
+from pathlib import Path
+import datetime
+import os
+import sqlite3
+import sys
+
+
+LOG = "--- "
+IRSSI = " -!- "
+AWAY = "* "
+ACTION = "-"
+NETWORK = "!"
+PLAYBACK = "<***> Buffer "
+CORRUPT_MSG = "<"
+CORRUPT_ACTION = "* "
+
+JOIN_PART = "*** "
+
+LOG_OPENED = "--- Log opened "
+LOG_CLOSED = "--- Log closed "
+DAY_CHANGED = "--- Day changed "
+
+paths = [Path(path) for path in sys.argv[1:]]
+
+def _dot_date(path):
+    channel, _, month_day = path.stem.rpartition(".")
+    month, _, day = month_day.partition("-")
+    year = path.parent.parent.name
+    date = datetime.date(year=int(year), month=int(month), day=int(day))
+    return channel, _contiguous_lines
+
+
+def _underscore_date(path):
+    channel, _, ymd = path.stem.rpartition("_")
+    date = datetime.datetime.strptime(ymd, "%Y%m%d").date()
+    return channel, partial(_bracket, date=date)
+
+
+def _contiguous_date(path):
+    """
+    E.g. just ``#math.log`` with lines deliniating days.
+    """
+    return path.stem, _contiguous_lines
+
+
+def _no_bracket(file, date):
+    for line in file:
+        if line.startswith((LOG, CORRUPT_MSG, CORRUPT_ACTION)) or line == "\n":
+            continue
+
+        time, _, rest = line[:-1].partition(" ")
+
+        if rest.startswith((IRSSI, PLAYBACK, AWAY, ACTION, NETWORK, time + " ")):
+            continue
+
+        assert rest.startswith("<"), rest
+
+        hour, _, minute = time.partition(":")
+        dt = datetime.datetime.combine(
+            date,
+            datetime.time(hour=int(hour), minute=int(minute)),
+        )
+
+        yield dt, rest
+
+
+def _bracket(file, date):
+    for line in file:
+        assert line.startswith("["), line
+        time, _, rest = line[1:-1].partition("] ")
+
+        if rest.startswith((JOIN_PART, ACTION)):
+            continue
+
+        dt = datetime.datetime.combine(
+            date,
+            datetime.time.fromisoformat(time),
+        )
+        yield dt, rest
+
+
+def _colon_delimited(file, date):
+    for line in file:
+        assert line.startswith("["), line
+        time, _, rest = line[1:-1].partition("] ")
+
+        if rest.startswith((JOIN_PART, ACTION)):
+            continue
+
+        dt = datetime.datetime.combine(
+            date,
+            datetime.time.fromisoformat(time),
+        )
+        yield dt, rest
+
+
+def _contiguous_day(line):
+    *start, date = line[:-1].partition(LOG_OPENED)
+    assert start == ["", LOG_OPENED], line
+    return datetime.datetime.strptime(date, "%a %b %d %H:%M:%S %Y").date()
+
+
+def _contiguous_lines(file):
+    date = _contiguous_day(next(file))
+    for line in file:
+        if line.startswith(LOG_OPENED):
+            date = _contiguous_day(line)
+            continue
+        elif line.startswith(DAY_CHANGED):
+            date = datetime.datetime.strptime(
+                line[:-1],
+                DAY_CHANGED + "%a %b %d %Y",
+            ).date()
+            continue
+        elif line.startswith(LOG_CLOSED) or line == "\n":
+            continue
+
+        time, _, rest = line[:-1].partition(" ")
+        if rest.lstrip().startswith((">>> ", "<   ", "~   ", "Irssi: ", "[notice(", "Topic ", "You're now known as ", IRSSI[1:], "tos9 changed the topic of ", "-")):
+            continue
+        elif rest.lstrip().startswith("*") and " <-\\->" in rest:
+            continue
+        elif not rest.startswith("<") and " was kicked from ":
+            continue
+
+        hour, _, minute = time.partition(":")
+        dt = datetime.datetime.combine(
+            date,
+            datetime.time(hour=int(hour), minute=int(minute)),
+        )
+
+        if rest.startswith("        "):
+            sender, _, contents = rest.lstrip().partition(" ")
+            yield dt, sender + "> " + contents
+        elif rest.startswith("* "):
+            sender, _, contents = rest[2:].partition(" ")
+            yield dt, sender + "> " + contents
+        elif "| " in rest:
+            sender, _, contents = rest.lstrip(" @").partition("|")
+            yield dt, sender + "> " + contents
+        else:
+            assert rest.startswith("<"), rest
+            if rest[1] in {" ", "@"}:
+                rest = rest[1:]
+            yield dt, rest
+
+
+class ColonSeparatedSenderParser(object):
+    """
+    E.g. just ``2011-01-23.log`` and where sender is just separated by ':'.
+    """
+
+    def __init__(self, path):
+        self.channel = path.parent.name
+        self.date = datetime.datetime.strptime(path.stem, "%Y-%m-%d").date()
+
+    def messages_in(self, file):
+        for line in file:
+            dt, rest = _bracketed_time(date=self.date, line=line[:-1])
+
+            if (
+                rest == "Disconnected" or rest.startswith(
+                    (
+                        "Topic is ",
+                        "Set by ",
+                        "Website is ",
+                        "\x02ChanServ\x02 sets ",
+                    )
+                )
+            ):
+                continue
+
+            sender, _, contents = rest.partition(" ")
+            if sender.endswith(":"):
+                sender = sender[:-1]
+                yield self.channel, dt, sender, contents
+            else:
+                is_joinpart = contents.startswith("(")
+                assert is_joinpart or contents.startswith(
+                    (
+                        "is now known as ",
+                        "changed the topic to ",
+                        "sets mode ",
+                        "has userhost ",
+                        "kicked ",
+                        "is on #",
+                        "is connected on ",
+                        "signed on at ",
+                        "is logged in as ",
+                        "is using a secure connection",
+                        "is away (",
+                    ),
+                ), repr(line)
+
+
+def _irssi_messages_in(self, file):
+    for line in file:
+        if not line.strip().strip("\x00"):
+            continue
+
+        dt, rest = _bracketed_time(date=self.date, line=line[:-1])
+
+        is_irc_message = rest.startswith(
+            ("*** ", "Connected to IRC (", "Disconnected from IRC ("),
+        )
+        if is_irc_message:
+            continue
+
+        is_action = rest.startswith("* ")
+        if is_action:
+            sender, did_something, contents = rest[2:].partition(" ")
+            assert did_something, rest
+        else:
+            is_query = rest.startswith("-")
+            if is_query:
+                sender, valid_query, contents = rest[1:].partition("- ")
+                assert valid_query, rest
+            else:
+                assert rest.startswith("<"), rest
+                sender, bracket, contents = rest[1:].partition("> ")
+                assert bracket, repr(rest)
+        yield self.channel, dt, sender, contents
+
+
+class BracketedParser(object):
+    """
+    Just ``20110123.log`` and where sender is separated by '<sender> '.
+    """
+
+    def __init__(self, path):
+        self.channel = path.parent.name
+        if "-" in path.stem:
+            fmt = "%Y-%m-%d"
+        else:
+            fmt = "%Y%m%d"
+        self.date = datetime.datetime.strptime(path.stem, fmt).date()
+
+    messages_in = _irssi_messages_in
+
+
+class FlatBracketedParser(object):
+    """
+    ``network_#channel_20110123.log`` and sender is separated by '<sender> '.
+    """
+
+    def __init__(self, path):
+        _, channel_and_date = path.stem.split("_", 1)
+        self.channel, _, date = channel_and_date.rpartition("_")
+        self.date = datetime.datetime.strptime(date, "%Y%m%d").date()
+
+    messages_in = _irssi_messages_in
+
+
+def _bracketed_time(date, line):
+    bracketed, _, rest = line.partition("] ")
+    time = datetime.datetime.strptime(
+        bracketed.lstrip("\x00"),
+        "[%H:%M:%S",
+    ).time()
+    return datetime.datetime.combine(date, time), rest
+
+
+def messages(path):
+    with path.open(errors="replace") as file:
+        if path.stem.count("_") >= 2:
+            Parser = FlatBracketedParser
+        else:
+            Parser = BracketedParser
+
+        yield from Parser(path).messages_in(file)
+
+
+with sqlite3.connect("/Users/Julian/Desktop/irc/irc.sqlite") as conn:
+    for path in paths:
+        conn.executemany(
+            """
+            INSERT INTO messages (channel, timestamp, sender, contents)
+            VALUES (?, ?, ?, ?)
+            """, messages(path),
+        )
